@@ -138,6 +138,9 @@ class RequestSnapshot:
     interleaved: bool = False
     # Anthropic cache_control present anywhere in the request.
     has_breakpoint: bool = False
+    # What this ledger has seen of the cache's lifetime on this provider and model
+    # (prefixwise.lifetime.Observed), used only when no TTL is known for the request.
+    observed_lifetime: object | None = None
     breakpoint_after_volatile: bool = False
     min_prefix_tokens: int | None = None
 
@@ -153,6 +156,9 @@ class Classification:
     # False when the verdict overrides the pair the provider compared (an expired entry, a change
     # that cost nothing): its native reason then describes another question, not a disagreement.
     score: bool = True
+    # True when the prefix was unchanged and less than half of it was read, whatever cause that was
+    # then given: the evidence prefixwise.lifetime learns cache lifetimes from.
+    cold_unchanged: bool = False
 
 
 def _blocks_by_role(blocks: list[BlockFingerprint]) -> dict[str, list[BlockFingerprint]]:
@@ -522,7 +528,8 @@ def classify(prev: RequestSnapshot | None, curr: RequestSnapshot,
 
     # Anthropic writes only at a breakpoint: a previous turn without one left nothing to read,
     # so a zero read on the first turn that carries one is the first write, not a miss.
-    if curr.provider == "anthropic" and curr.has_breakpoint and not prev.has_breakpoint and curr.cached_tokens == 0:
+    # A part read now (another conversation's write of the same system prompt) does not change that.
+    if curr.provider == "anthropic" and curr.has_breakpoint and not prev.has_breakpoint:
         return Classification(MissCause.FIRST_WRITE, True,
                               "the previous turn carried no cache_control, so nothing was written for this turn "
                               "to read; this turn's write is the first", secondary, native_reason)
@@ -555,7 +562,7 @@ def classify(prev: RequestSnapshot | None, curr: RequestSnapshot,
     # Identical replay within a short window is a retry, not a cache miss.
     if prev.blocks and curr.blocks and \
        [b.raw for b in prev.blocks] == [b.raw for b in curr.blocks] and \
-       curr.gap_seconds is not None and curr.gap_seconds < 60 and curr.cached_tokens == 0:
+       curr.gap_seconds is not None and curr.gap_seconds < 60:
         return Classification(MissCause.RETRY_REPLAY, False,
                               "identical request within the retry window", secondary, native_reason)
 
@@ -585,26 +592,61 @@ def classify(prev: RequestSnapshot | None, curr: RequestSnapshot,
                               secondary, native_reason)
 
     gap, ttl = curr.gap_seconds, curr.ttl_seconds
+    # How much of the unchanged prefix came back, named in every verdict below: a partial read is
+    # a miss of its own size, not a hit.
+    read = (f"read {curr.cached_tokens:,} of the {reusable:,}-token unchanged prefix" if curr.cached_tokens
+            else "nothing read from cache")
+    observed = curr.observed_lifetime if ttl is None else None
     if ttl is not None and gap is not None and gap > ttl:
         return Classification(MissCause.TTL_EXPIRED, True,
-                              f"gap {gap:.0f}s since last turn exceeds the cache TTL {ttl:.0f}s",
-                              secondary, native_reason)
+                              f"gap {gap:.0f}s since last turn exceeds the cache TTL {ttl:.0f}s; {read}",
+                              secondary, native_reason, cold_unchanged=True)
 
-    if curr.cached_tokens == 0 and curr.prompt_tokens > 0 and gap is not None and \
-       (gap <= (ttl if ttl is not None else MIN_PROVIDER_TTL_SECONDS)):
-        window = f"TTL {ttl:.0f}s" if ttl is not None else f"shortest provider TTL {MIN_PROVIDER_TTL_SECONDS}s"
+    # Within the TTL (or, when it is unknown, within the shortest TTL any provider keeps), an
+    # unchanged prefix that came back short did not expire. With no eviction evidence, the request
+    # most likely reached a cache that did not hold it (another server). A partial read is the same
+    # miss as a zero read, only smaller: implicit caches (OpenAI, DeepSeek, Gemini) do both.
+    # On Anthropic a part read after more than 5 minutes is what a mixed lifetime looks like: a 1-hour
+    # breakpoint early in the prompt still read, a 5-minute one after it expired. The request's TTL is
+    # the longest any breakpoint asked for, so a part read is judged by the shortest (5 minutes).
+    limit = ttl if ttl is not None else MIN_PROVIDER_TTL_SECONDS
+    alive = getattr(observed, "alive_up_to", None)
+    if alive is not None and alive > limit:
+        limit = alive  # the cache has been seen to hold an unchanged prefix this long here
+    if curr.cached_tokens and curr.provider == "anthropic":
+        limit = min(limit, MIN_PROVIDER_TTL_SECONDS)
+    if curr.prompt_tokens > 0 and gap is not None and gap <= limit:
+        window = (f"TTL {ttl:.0f}s" if ttl is not None and limit == ttl
+                  else f"{MIN_PROVIDER_TTL_SECONDS // 60} minutes (the shortest TTL a breakpoint can have)"
+                  if curr.provider == "anthropic" and curr.cached_tokens
+                  else f"the observed lifetime on this model: {observed.describe()}"
+                  if alive is not None and gap > MIN_PROVIDER_TTL_SECONDS
+                  else f"shortest provider TTL {MIN_PROVIDER_TTL_SECONDS}s")
         return Classification(MissCause.ROUTING_MISS, None,
                               f"inferred: blocks and params equal, gap {gap:.0f}s within {window}, "
-                              "no eviction evidence, nothing read from cache",
-                              secondary, native_reason)
-    if curr.prompt_tokens > 0 and gap is not None and ttl is None:
+                              f"no eviction evidence, {read}",
+                              secondary, native_reason, cold_unchanged=True)
+    if curr.prompt_tokens > 0 and gap is not None and curr.cached_tokens and curr.provider == "anthropic":
         return Classification(MissCause.UNKNOWN, None,
-                              f"prefix reusable but cache_read low after a {gap:.0f}s gap with unknown TTL:"
-                              " expiry or routing, not distinguishable",
-                              secondary, native_reason)
+                              f"a part read ({read}) {gap:.0f}s after the last turn: a 5-minute breakpoint may "
+                              "have expired while an earlier 1-hour one held, or the request reached another "
+                              "server: expiry or routing, not distinguishable",
+                              secondary, native_reason, cold_unchanged=True)
+    cold = getattr(observed, "cold_from", None)
+    if curr.prompt_tokens > 0 and gap is not None and cold is not None and gap >= cold:
+        return Classification(MissCause.TTL_EXPIRED, True,
+                              f"inferred: gap {gap:.0f}s is past the observed lifetime on this model "
+                              f"({observed.describe()}); {read}",
+                              secondary, native_reason, cold_unchanged=True)
+    if curr.prompt_tokens > 0 and gap is not None and ttl is None:
+        seen = f"; observed on this model: {observed.describe()}" if observed is not None else ""
+        return Classification(MissCause.UNKNOWN, None,
+                              f"prefix reusable but cache_read low ({read}) after a {gap:.0f}s gap with unknown"
+                              f" TTL: expiry or routing, not distinguishable{seen}",
+                              secondary, native_reason, cold_unchanged=True)
     return Classification(MissCause.UNKNOWN, None,
-                          "prefix reusable but cache_read low; no timing or usage evidence to name a cause",
-                          secondary, native_reason)
+                          f"prefix reusable but cache_read low ({read}); no timing or usage evidence to name a cause",
+                          secondary, native_reason, cold_unchanged=True)
 
 
 def classify_first_divergence(changed_role: str | None, *, model_changed: bool = False,
